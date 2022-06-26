@@ -1,0 +1,616 @@
+From f4414a06f6e9b7a019d03c98f846ad00bebb4197 Mon Sep 17 00:00:00 2001
+From: Kacper Rzetelski <rzetelski.k@gmail.com>
+Date: Thu, 28 Apr 2022 20:30:07 +0200
+Subject: [PATCH] Implement sanitizer
+
+---
+ fs/file_table.c                     |   1 +
+ fs/open.c                           |  14 +++
+ fs/read_write.c                     | 115 +++++++++++++++++++++++-
+ include/linux/bpf.h                 |   2 +
+ include/linux/bpf_sanitizer.h       |  36 ++++++++
+ include/linux/bpf_types.h           |   2 +
+ include/linux/fs.h                  |   2 +
+ include/linux/sanitizer_hook_defs.h |   2 +
+ include/uapi/linux/bpf.h            |   4 +
+ kernel/bpf/Makefile                 |   1 +
+ kernel/bpf/bpf_sanitizer.c          | 130 ++++++++++++++++++++++++++++
+ kernel/bpf/syscall.c                |  14 ++-
+ kernel/bpf/verifier.c               |   7 ++
+ mm/nommu.c                          |   3 +
+ 14 files changed, 329 insertions(+), 4 deletions(-)
+ create mode 100644 include/linux/bpf_sanitizer.h
+ create mode 100644 include/linux/sanitizer_hook_defs.h
+ create mode 100644 kernel/bpf/bpf_sanitizer.c
+
+diff --git a/fs/file_table.c b/fs/file_table.c
+index 45437f8e1..799390bb3 100644
+--- a/fs/file_table.c
++++ b/fs/file_table.c
+@@ -116,6 +116,7 @@ static struct file *__alloc_file(int flags, const struct cred *cred)
+ 	f->f_flags = flags;
+ 	f->f_mode = OPEN_FMODE(flags);
+ 	/* f->f_version: 0 */
++	f->f_sanitize = false;
+ 
+ 	return f;
+ }
+diff --git a/fs/open.c b/fs/open.c
+index f732fb946..57bf7558b 100644
+--- a/fs/open.c
++++ b/fs/open.c
+@@ -32,6 +32,7 @@
+ #include <linux/ima.h>
+ #include <linux/dnotify.h>
+ #include <linux/compat.h>
++#include <linux/bpf_sanitizer.h>
+ 
+ #include "internal.h"
+ 
+@@ -1214,11 +1215,24 @@ static long do_sys_openat2(int dfd, const char __user *filename,
+ 			put_unused_fd(fd);
+ 			fd = PTR_ERR(f);
+ 		} else {
++#ifdef CONFIG_BPF_SYSCALL
++			struct sanitizer_kernel_ctx ctx;
++
++			ctx.buf = NULL;
++			ctx.bpf_ctx.mode = op.mode;
++			ctx.bpf_ctx.flags = op.open_flag;
++			ctx.bpf_ctx.uid = f->f_inode->i_uid;
++			ctx.bpf_ctx.gid = f->f_inode->i_gid;
++
++			f->f_sanitize = (bool)bpf_sanitizer_check(&ctx.bpf_ctx);
++#endif /* CONFIG_BPF_SYSCALL */
++
+ 			fsnotify_open(f);
+ 			fd_install(fd, f);
+ 		}
+ 	}
+ 	putname(tmp);
++
+ 	return fd;
+ }
+ 
+diff --git a/fs/read_write.c b/fs/read_write.c
+index 0074afa7e..4d20edcb6 100644
+--- a/fs/read_write.c
++++ b/fs/read_write.c
+@@ -24,6 +24,8 @@
+ 
+ #include <linux/uaccess.h>
+ #include <asm/unistd.h>
++#include <linux/bpf_sanitizer.h>
++#include <linux/vmalloc.h>
+ 
+ const struct file_operations generic_ro_fops = {
+ 	.llseek		= generic_file_llseek,
+@@ -567,6 +569,41 @@ ssize_t kernel_write(struct file *file, const void *buf, size_t count,
+ }
+ EXPORT_SYMBOL(kernel_write);
+ 
++#ifdef CONFIG_BPF_SYSCALL
++static ssize_t sanitizer_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
++{
++	struct sanitizer_kernel_ctx ctx;
++	ssize_t ret = 0;
++	void *kbuf;
++
++	kbuf = kvmalloc(count, GFP_KERNEL);
++	if (!kbuf) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (unlikely(copy_from_user(kbuf, buf, count))) {
++		ret = -EINVAL;
++		goto cleanup;
++	}
++
++	ctx.buf = kbuf;
++	ctx.bpf_ctx.offset = *pos;
++	ctx.bpf_ctx.size = count;
++
++	if (bpf_sanitizer_sanitize(&ctx.bpf_ctx)) {
++		ret = -EINVAL;
++		goto cleanup;
++	}
++
++	ret =  __kernel_write(file, kbuf, count, pos);
++cleanup:
++	kvfree(kbuf);
++out:
++	return ret;
++}
++#endif /* CONFIG_BPF_SYSCALL */
++
+ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_t *pos)
+ {
+ 	ssize_t ret;
+@@ -583,8 +620,15 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
+ 		return ret;
+ 	if (count > MAX_RW_COUNT)
+ 		count =  MAX_RW_COUNT;
++
+ 	file_start_write(file);
+-	if (file->f_op->write)
++	if (file->f_sanitize)
++#ifdef CONFIG_BPF_SYSCALL
++		ret = sanitizer_write(file, buf, count, pos);
++#else /* !CONFIG_BPF_SYSCALL */
++		ret = -EOPNOTSUPP;
++#endif /* CONFIG_BPF_SYSCALL */
++	else if (file->f_op->write)
+ 		ret = file->f_op->write(file, buf, count, pos);
+ 	else if (file->f_op->write_iter)
+ 		ret = new_sync_write(file, buf, count, pos);
+@@ -596,6 +640,7 @@ ssize_t vfs_write(struct file *file, const char __user *buf, size_t count, loff_
+ 	}
+ 	inc_syscw(current);
+ 	file_end_write(file);
++
+ 	return ret;
+ }
+ 
+@@ -829,6 +874,66 @@ ssize_t vfs_iter_read(struct file *file, struct iov_iter *iter, loff_t *ppos,
+ }
+ EXPORT_SYMBOL(vfs_iter_read);
+ 
++#ifdef CONFIG_BPF_SYSCALL
++ssize_t sanitizer_writev_once(struct file *file, struct iovec *iovec,
++			      loff_t *pos)
++{
++	struct sanitizer_kernel_ctx ctx;
++	ssize_t ret = 0;
++	void *kbuf;
++
++	kbuf = kvmalloc(iovec->iov_len, GFP_KERNEL);
++	if (!kbuf) {
++		ret = -EINVAL;
++		goto out;
++	}
++
++	if (unlikely(copy_from_user(kbuf, iovec->iov_base, iovec->iov_len))) {
++		ret = -EINVAL;
++		goto cleanup;
++	}
++
++	ctx.buf = kbuf;
++	ctx.bpf_ctx.offset = *pos;
++	ctx.bpf_ctx.size = iovec->iov_len;
++
++	if (bpf_sanitizer_sanitize(&ctx.bpf_ctx)) {
++		ret = -EINVAL;
++		goto cleanup;
++	}
++
++	ret = __kernel_write(file, kbuf, iovec->iov_len, pos);
++cleanup:
++	kvfree(kbuf);
++out:
++	return ret;
++}
++
++ssize_t sanitizer_writev(struct file *file, struct iov_iter *iter, loff_t *pos)
++{
++	ssize_t ret = 0;
++	ssize_t nr;
++
++	while (iov_iter_count(iter)) {
++		struct iovec iovec = iov_iter_iovec(iter);
++
++		nr = sanitizer_writev_once(file, &iovec, pos);
++
++		ret += nr;
++		if (nr < 0)
++			return nr;
++		else if (nr != iovec.iov_len) {
++			break;
++		}
++
++		iov_iter_advance(iter, nr);
++	}
++
++	return ret;
++}
++#endif /* CONFIG_BPF_SYSCALL */
++
++
+ static ssize_t do_iter_write(struct file *file, struct iov_iter *iter,
+ 		loff_t *pos, rwf_t flags)
+ {
+@@ -847,7 +952,13 @@ static ssize_t do_iter_write(struct file *file, struct iov_iter *iter,
+ 	if (ret < 0)
+ 		return ret;
+ 
+-	if (file->f_op->write_iter)
++	if (file->f_sanitize)
++#ifdef CONFIG_BPF_SYSCALL
++		ret = sanitizer_writev(file, iter, pos);
++#else /* !CONFIG_BPF_SYSCALL */
++		ret = -EOPNOTSUPP;
++#endif /* CONFIG_BPF_SYSCALL */
++	else if (file->f_op->write_iter)
+ 		ret = do_iter_readv_writev(file, iter, pos, WRITE, flags);
+ 	else
+ 		ret = do_loop_readv_writev(file, iter, pos, WRITE, flags);
+diff --git a/include/linux/bpf.h b/include/linux/bpf.h
+index 9f20b0f53..7e3eb0fb9 100644
+--- a/include/linux/bpf.h
++++ b/include/linux/bpf.h
+@@ -2153,6 +2153,8 @@ extern const struct bpf_func_proto bpf_btf_find_by_name_kind_proto;
+ extern const struct bpf_func_proto bpf_sk_setsockopt_proto;
+ extern const struct bpf_func_proto bpf_sk_getsockopt_proto;
+ extern const struct bpf_func_proto bpf_kallsyms_lookup_name_proto;
++extern const struct bpf_func_proto bpf_copy_from_buffer_proto;
++extern const struct bpf_func_proto bpf_copy_to_buffer_proto;
+ 
+ const struct bpf_func_proto *tracing_prog_func_proto(
+   enum bpf_func_id func_id, const struct bpf_prog *prog);
+diff --git a/include/linux/bpf_sanitizer.h b/include/linux/bpf_sanitizer.h
+new file mode 100644
+index 000000000..396bdb75b
+--- /dev/null
++++ b/include/linux/bpf_sanitizer.h
+@@ -0,0 +1,36 @@
++#ifndef _LINUX_BPF_SANITIZER_H
++#define _LINUX_BPF_SANITIZER_H
++
++#include <linux/bpf.h>
++
++struct sanitizer_ctx {
++	union {
++		/* bpf_sanitizer_sanitize */
++		struct {
++			loff_t offset;
++			size_t size;
++		};
++		/* bpf_sanitizer_check */
++		struct {
++			u64 flags; /* open flags */
++			umode_t mode; /* inode mode */
++			kuid_t uid; /* owner */
++			kgid_t gid; /* group */
++		};
++	};
++};
++
++struct sanitizer_kernel_ctx {
++	void *buf;
++	struct sanitizer_ctx bpf_ctx;
++};
++
++#define SANITIZER_HOOK(RET, DEFAULT, NAME, ...) \
++	RET bpf_sanitizer_##NAME(__VA_ARGS__);
++#include <linux/sanitizer_hook_defs.h>
++#undef SANITIZER_HOOK
++
++int bpf_sanitizer_verify_prog(struct bpf_verifier_log *vlog,
++				     const struct bpf_prog *prog);
++
++#endif /* _LINUX_BPF_SANITIZER_H */
+diff --git a/include/linux/bpf_types.h b/include/linux/bpf_types.h
+index 48a91c51c..bbcc5876c 100644
+--- a/include/linux/bpf_types.h
++++ b/include/linux/bpf_types.h
+@@ -79,6 +79,8 @@ BPF_PROG_TYPE(BPF_PROG_TYPE_LSM, lsm,
+ #endif
+ BPF_PROG_TYPE(BPF_PROG_TYPE_SYSCALL, bpf_syscall,
+ 	      void *, void *)
++BPF_PROG_TYPE(BPF_PROG_TYPE_SANITIZER, sanitizer,
++	      void *, void *)
+ 
+ BPF_MAP_TYPE(BPF_MAP_TYPE_ARRAY, array_map_ops)
+ BPF_MAP_TYPE(BPF_MAP_TYPE_PERCPU_ARRAY, percpu_array_map_ops)
+diff --git a/include/linux/fs.h b/include/linux/fs.h
+index bbf812ce8..f24eead29 100644
+--- a/include/linux/fs.h
++++ b/include/linux/fs.h
+@@ -997,6 +997,8 @@ struct file {
+ 	struct address_space	*f_mapping;
+ 	errseq_t		f_wb_err;
+ 	errseq_t		f_sb_err; /* for syncfs */
++
++	bool 			f_sanitize;
+ } __randomize_layout
+   __attribute__((aligned(4)));	/* lest something weird decides that 2 is OK */
+ 
+diff --git a/include/linux/sanitizer_hook_defs.h b/include/linux/sanitizer_hook_defs.h
+new file mode 100644
+index 000000000..cd3e6b668
+--- /dev/null
++++ b/include/linux/sanitizer_hook_defs.h
+@@ -0,0 +1,2 @@
++SANITIZER_HOOK(int, 0, check, struct sanitizer_ctx *ctx);
++SANITIZER_HOOK(int, 0, sanitize, struct sanitizer_ctx *ctx);
+diff --git a/include/uapi/linux/bpf.h b/include/uapi/linux/bpf.h
+index b12cfcedd..088516a51 100644
+--- a/include/uapi/linux/bpf.h
++++ b/include/uapi/linux/bpf.h
+@@ -950,6 +950,7 @@ enum bpf_prog_type {
+ 	BPF_PROG_TYPE_LSM,
+ 	BPF_PROG_TYPE_SK_LOOKUP,
+ 	BPF_PROG_TYPE_SYSCALL, /* a program that can execute syscalls */
++	BPF_PROG_TYPE_SANITIZER
+ };
+ 
+ enum bpf_attach_type {
+@@ -995,6 +996,7 @@ enum bpf_attach_type {
+ 	BPF_SK_REUSEPORT_SELECT,
+ 	BPF_SK_REUSEPORT_SELECT_OR_MIGRATE,
+ 	BPF_PERF_EVENT,
++	BPF_SANITIZER,
+ 	__MAX_BPF_ATTACH_TYPE
+ };
+ 
+@@ -5120,6 +5122,8 @@ union bpf_attr {
+ 	FN(trace_vprintk),		\
+ 	FN(skc_to_unix_sock),		\
+ 	FN(kallsyms_lookup_name),	\
++	FN(copy_from_buffer),		\
++	FN(copy_to_buffer),		\
+ 	/* */
+ 
+ /* integer value in 'imm' field of BPF_CALL instruction selects which helper
+diff --git a/kernel/bpf/Makefile b/kernel/bpf/Makefile
+index cf6ca339f..b2d70a1ae 100644
+--- a/kernel/bpf/Makefile
++++ b/kernel/bpf/Makefile
+@@ -33,6 +33,7 @@ obj-$(CONFIG_DEBUG_INFO_BTF) += sysfs_btf.o
+ endif
+ ifeq ($(CONFIG_BPF_JIT),y)
+ obj-$(CONFIG_BPF_SYSCALL) += bpf_struct_ops.o
++obj-$(CONFIG_BPF_SYSCALL) += bpf_sanitizer.o
+ obj-${CONFIG_BPF_LSM} += bpf_lsm.o
+ endif
+ obj-$(CONFIG_BPF_PRELOAD) += preload/
+diff --git a/kernel/bpf/bpf_sanitizer.c b/kernel/bpf/bpf_sanitizer.c
+new file mode 100644
+index 000000000..0fea28830
+--- /dev/null
++++ b/kernel/bpf/bpf_sanitizer.c
+@@ -0,0 +1,130 @@
++#include <linux/bpf.h>
++#include <linux/btf.h>
++#include <linux/bpf_sanitizer.h>
++#include <linux/bpf_verifier.h>
++#include <linux/btf_ids.h>
++
++#define SANITIZER_HOOK(RET, DEFAULT, NAME, ...)                                \
++	noinline RET bpf_sanitizer_##NAME(__VA_ARGS__)                         \
++	{                                                                      \
++		return DEFAULT;                                                \
++	}
++
++#include <linux/sanitizer_hook_defs.h>
++#undef SANITIZER_HOOK
++
++#define SANITIZER_HOOK(RET, DEFAULT, NAME, ...)                                \
++	BTF_ID(func, bpf_sanitizer_##NAME)
++BTF_SET_START(bpf_sanitizer_hooks)
++#include <linux/sanitizer_hook_defs.h>
++#undef SANITIZER_HOOK
++BTF_SET_END(bpf_sanitizer_hooks)
++
++int bpf_sanitizer_verify_prog(struct bpf_verifier_log *vlog,
++			      const struct bpf_prog *prog)
++{
++	if (!btf_id_set_contains(&bpf_sanitizer_hooks,
++				 prog->aux->attach_btf_id)) {
++		return -EINVAL;
++	}
++
++	return 0;
++}
++
++BPF_CALL_4(bpf_copy_from_buffer, void *, ctx, u64, offset, void *, ptr, u32,
++	   size)
++{
++	struct sanitizer_kernel_ctx *kctx =
++		container_of(ctx, struct sanitizer_kernel_ctx, bpf_ctx);
++
++	if (!kctx->buf)
++		return size;
++
++	return raw_copy_to_user(ptr, ((char *)kctx->buf) + offset, size);
++}
++
++static bool bpf_copy_from_buffer_proto_allowed(const struct bpf_prog *prog)
++{
++	return prog->type == BPF_PROG_TYPE_SANITIZER &&
++	       prog->expected_attach_type == BPF_SANITIZER &&
++	       btf_id_set_contains(&bpf_sanitizer_hooks,
++				   prog->aux->attach_btf_id);
++}
++
++const struct bpf_func_proto bpf_copy_from_buffer_proto = {
++	.func = bpf_copy_from_buffer,
++	.gpl_only = false,
++	.ret_type = RET_INTEGER,
++	.arg1_type = ARG_PTR_TO_CTX,
++	.arg2_type = ARG_ANYTHING,
++	.arg3_type = ARG_PTR_TO_UNINIT_MEM,
++	.arg4_type = ARG_CONST_SIZE_OR_ZERO,
++	.allowed = bpf_copy_from_buffer_proto_allowed,
++};
++
++BPF_CALL_4(bpf_copy_to_buffer, void *, ctx, u64, offset, void *, ptr, u32, size)
++{
++	struct sanitizer_kernel_ctx *kctx =
++		container_of(ctx, struct sanitizer_kernel_ctx, bpf_ctx);
++
++	if (!kctx->buf)
++		return size;
++
++	return raw_copy_from_user(((char *)kctx->buf) + offset, ptr, size);
++}
++
++static bool bpf_copy_to_buffer_proto_allowed(const struct bpf_prog *prog)
++{
++	return prog->type == BPF_PROG_TYPE_SANITIZER &&
++	       prog->expected_attach_type == BPF_SANITIZER &&
++	       btf_id_set_contains(&bpf_sanitizer_hooks,
++				   prog->aux->attach_btf_id);
++}
++
++const struct bpf_func_proto bpf_copy_to_buffer_proto = {
++	.func = bpf_copy_to_buffer,
++	.gpl_only = false,
++	.ret_type = RET_INTEGER,
++	.arg1_type = ARG_PTR_TO_CTX,
++	.arg2_type = ARG_ANYTHING,
++	.arg3_type = ARG_PTR_TO_UNINIT_MEM,
++	.arg4_type = ARG_CONST_SIZE_OR_ZERO,
++	.allowed = bpf_copy_to_buffer_proto_allowed,
++};
++
++static const struct bpf_func_proto *
++bpf_sanitizer_func_proto(enum bpf_func_id func_id, const struct bpf_prog *prog)
++{
++	switch (func_id) {
++	case BPF_FUNC_get_current_uid_gid:
++		return &bpf_get_current_uid_gid_proto;
++	case BPF_FUNC_get_current_pid_tgid:
++		return &bpf_get_current_pid_tgid_proto;
++	case BPF_FUNC_copy_from_buffer:
++		return &bpf_copy_from_buffer_proto;
++	case BPF_FUNC_copy_to_buffer:
++		return &bpf_copy_to_buffer_proto;
++	default:
++		return bpf_base_func_proto(func_id);
++	}
++}
++
++static bool bpf_sanitizer_is_valid_access(int off, int size,
++					  enum bpf_access_type type,
++					  const struct bpf_prog *prog,
++					  struct bpf_insn_access_aux *info)
++{
++	if (off < 0 || off + size > sizeof(struct sanitizer_ctx))
++		return false;
++	if (type != BPF_READ)
++		return false;
++
++	return true;
++}
++
++const struct bpf_prog_ops sanitizer_prog_ops = {};
++
++const struct bpf_verifier_ops sanitizer_verifier_ops = {
++	.get_func_proto = bpf_sanitizer_func_proto,
++	.is_valid_access = bpf_sanitizer_is_valid_access,
++};
+diff --git a/kernel/bpf/syscall.c b/kernel/bpf/syscall.c
+index 1033ee8c0..3ba75f464 100644
+--- a/kernel/bpf/syscall.c
++++ b/kernel/bpf/syscall.c
+@@ -27,6 +27,7 @@
+ #include <uapi/linux/btf.h>
+ #include <linux/pgtable.h>
+ #include <linux/bpf_lsm.h>
++#include <linux/bpf_sanitizer.h>
+ #include <linux/poll.h>
+ #include <linux/bpf-netns.h>
+ #include <linux/rcupdate_trace.h>
+@@ -2068,6 +2069,7 @@ bpf_prog_load_check_attach(enum bpf_prog_type prog_type,
+ 		case BPF_PROG_TYPE_LSM:
+ 		case BPF_PROG_TYPE_STRUCT_OPS:
+ 		case BPF_PROG_TYPE_EXT:
++		case BPF_PROG_TYPE_SANITIZER:
+ 			break;
+ 		default:
+ 			return -EINVAL;
+@@ -2724,6 +2726,12 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
+ 			goto out_put_prog;
+ 		}
+ 		break;
++	case BPF_PROG_TYPE_SANITIZER:
++		if (prog->expected_attach_type != BPF_SANITIZER) {
++			err = -EINVAL;
++			goto out_put_prog;
++		}
++		break;
+ 	default:
+ 		err = -EINVAL;
+ 		goto out_put_prog;
+@@ -2782,13 +2790,14 @@ static int bpf_tracing_prog_attach(struct bpf_prog *prog,
+ 	 */
+ 	if (!prog->aux->dst_trampoline && !tgt_prog) {
+ 		/*
+-		 * Allow re-attach for TRACING and LSM programs. If it's
++		 * Allow re-attach for TRACING, LSM and SANITIZER programs. If it's
+ 		 * currently linked, bpf_trampoline_link_prog will fail.
+ 		 * EXT programs need to specify tgt_prog_fd, so they
+ 		 * re-attach in separate code path.
+ 		 */
+ 		if (prog->type != BPF_PROG_TYPE_TRACING &&
+-		    prog->type != BPF_PROG_TYPE_LSM) {
++		    prog->type != BPF_PROG_TYPE_LSM &&
++		    prog->type != BPF_PROG_TYPE_SANITIZER) {
+ 			err = -EINVAL;
+ 			goto out_unlock;
+ 		}
+@@ -3038,6 +3047,7 @@ static int bpf_raw_tracepoint_open(const union bpf_attr *attr)
+ 	case BPF_PROG_TYPE_TRACING:
+ 	case BPF_PROG_TYPE_EXT:
+ 	case BPF_PROG_TYPE_LSM:
++	case BPF_PROG_TYPE_SANITIZER:
+ 		if (attr->raw_tracepoint.name) {
+ 			/* The attach point for this category of programs
+ 			 * should be specified via btf_id during program load.
+diff --git a/kernel/bpf/verifier.c b/kernel/bpf/verifier.c
+index 6b9874077..44942cd93 100644
+--- a/kernel/bpf/verifier.c
++++ b/kernel/bpf/verifier.c
+@@ -21,6 +21,7 @@
+ #include <linux/ctype.h>
+ #include <linux/error-injection.h>
+ #include <linux/bpf_lsm.h>
++#include <linux/bpf_sanitizer.h>
+ #include <linux/btf_ids.h>
+ 
+ #include "disasm.h"
+@@ -13728,6 +13729,7 @@ int bpf_check_attach_target(struct bpf_verifier_log *log,
+ 		fallthrough;
+ 	case BPF_MODIFY_RETURN:
+ 	case BPF_LSM_MAC:
++	case BPF_SANITIZER:
+ 	case BPF_TRACE_FENTRY:
+ 	case BPF_TRACE_FEXIT:
+ 		if (!btf_type_is_func(t)) {
+@@ -13854,6 +13856,7 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
+ 
+ 	if (prog->type != BPF_PROG_TYPE_TRACING &&
+ 	    prog->type != BPF_PROG_TYPE_LSM &&
++	    prog->type != BPF_PROG_TYPE_SANITIZER &&
+ 	    prog->type != BPF_PROG_TYPE_EXT)
+ 		return 0;
+ 
+@@ -13892,6 +13895,10 @@ static int check_attach_btf_id(struct bpf_verifier_env *env)
+ 		ret = bpf_lsm_verify_prog(&env->log, prog);
+ 		if (ret < 0)
+ 			return ret;
++	} else if (prog->type == BPF_PROG_TYPE_SANITIZER) {
++		ret = bpf_sanitizer_verify_prog(&env->log, prog);
++		if (ret < 0)
++			return ret;
+ 	} else if (prog->type == BPF_PROG_TYPE_TRACING &&
+ 		   btf_id_set_contains(&btf_id_deny, btf_id)) {
+ 		return -EINVAL;
+diff --git a/mm/nommu.c b/mm/nommu.c
+index 55a9e48a7..a5a02a855 100644
+--- a/mm/nommu.c
++++ b/mm/nommu.c
+@@ -873,6 +873,9 @@ static int validate_mmap_request(struct file *file,
+ 			/* backing file is not executable, try to copy */
+ 			capabilities &= ~NOMMU_MAP_DIRECT;
+ 		}
++
++		if (file->f_sanitize)
++			return -EPERM;
+ 	} else {
+ 		/* anonymous mappings are always memory backed and can be
+ 		 * privately mapped
+-- 
+2.35.1
+
